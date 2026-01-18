@@ -28,21 +28,6 @@ ipcMain.handle("open-external", async (_event, url) => {
 });
 
 /* ======================================================
-   IPC – בדיקת עדכונים ידנית (UI → main)
-   (יעבוד רק בגרסה ארוזה)
-====================================================== */
-ipcMain.handle("check-updates", async () => {
-  try {
-    if (!app.isPackaged) return { ok: false, reason: "not_packaged" };
-    autoUpdater.checkForUpdates(); // לא צריך await
-    return { ok: true };
-  } catch (e) {
-    log.error("check-updates failed:", e);
-    return { ok: false, error: String(e?.message || e) };
-  }
-});
-
-/* ======================================================
    עזר: בדיקת זמינות שרת
 ====================================================== */
 function pingServer(url) {
@@ -78,20 +63,30 @@ async function waitForServerReady(timeoutMs = 20000) {
    הפעלת server.cjs כתהליך Node פנימי
 ====================================================== */
 function startServer() {
+  // ✅ תיקון: ב-packaged server.cjs נמצא בתוך app.asar (app.getAppPath())
   const serverPath = app.isPackaged
-    ? path.join(process.resourcesPath, "app", "server.cjs")
-    : path.join(app.getAppPath(), "server.cjs");
+    ? path.join(app.getAppPath(), "server.cjs")
+    : path.join(app.getAppPath(), "server.cjs"); // dev: app.getAppPath() מצביע לפרויקט
 
   log.info("Starting server:", serverPath);
 
+  // ✅ חשוב: לא להתעלם מהפלט כדי שנראה למה השרת נופל
   serverProcess = spawn(process.execPath, [serverPath], {
     env: {
       ...process.env,
       ELECTRON_RUN_AS_NODE: "1",
       PORT: String(SERVER_PORT),
     },
-    stdio: "ignore",
+    stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
+  });
+
+  serverProcess.stdout?.on("data", (buf) => {
+    log.info("[server stdout]", buf.toString());
+  });
+
+  serverProcess.stderr?.on("data", (buf) => {
+    log.error("[server stderr]", buf.toString());
   });
 
   serverProcess.on("exit", (code) => {
@@ -127,11 +122,8 @@ function installExternalLinkHandlers(win) {
    Auto Update (electron-updater)
 ====================================================== */
 function setupAutoUpdates() {
-  // לוגים
   log.transports.file.level = "info";
   autoUpdater.logger = log;
-
-  // לא מורידים אוטומטית בלי לשאול
   autoUpdater.autoDownload = false;
 
   autoUpdater.on("error", (err) => {
@@ -139,10 +131,7 @@ function setupAutoUpdates() {
   });
 
   autoUpdater.on("update-available", async () => {
-    // ✅ חיווי ל-UI (אם תרצי להציג Badge/Toast)
-    try {
-      mainWindow?.webContents?.send("update-available");
-    } catch {}
+    mainWindow?.webContents?.send("update-available");
 
     const choice = await dialog.showMessageBox(mainWindow, {
       type: "info",
@@ -160,30 +149,14 @@ function setupAutoUpdates() {
 
   autoUpdater.on("update-not-available", () => {
     log.info("No updates available");
-    // אופציונלי:
-    // try { mainWindow?.webContents?.send("update-not-available"); } catch {}
   });
 
   autoUpdater.on("download-progress", (p) => {
-    const percent = Number(p?.percent || 0);
-    log.info(`Download ${percent.toFixed(1)}%`);
-
-    // ✅ אופציונלי: חיווי התקדמות ל-UI
-    try {
-      mainWindow?.webContents?.send("update-download-progress", {
-        percent,
-        bytesPerSecond: p?.bytesPerSecond || 0,
-        transferred: p?.transferred || 0,
-        total: p?.total || 0,
-      });
-    } catch {}
+    log.info(`Download ${Number(p.percent || 0).toFixed(1)}%`);
   });
 
   autoUpdater.on("update-downloaded", async () => {
-    // ✅ חיווי ל-UI
-    try {
-      mainWindow?.webContents?.send("update-downloaded");
-    } catch {}
+    mainWindow?.webContents?.send("update-downloaded");
 
     const choice = await dialog.showMessageBox(mainWindow, {
       type: "question",
@@ -199,6 +172,19 @@ function setupAutoUpdates() {
     }
   });
 }
+
+/* ======================================================
+   IPC – בדיקת עדכונים ידנית (UI → main)
+====================================================== */
+ipcMain.handle("check-updates", async () => {
+  try {
+    await autoUpdater.checkForUpdates();
+    return { ok: true };
+  } catch (e) {
+    log.error("check-updates failed:", e);
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
 
 /* ======================================================
    יצירת חלון ראשי
@@ -221,34 +207,39 @@ async function createWindow() {
   installExternalLinkHandlers(mainWindow);
 
   if (app.isPackaged) {
-    const indexHtml = path.join(
-      process.resourcesPath,
-      "app",
-      "dist",
-      "index.html"
-    );
+    const indexHtml = path.join(process.resourcesPath, "app.asar", "dist", "index.html");
     await mainWindow.loadFile(indexHtml);
   } else {
     await mainWindow.loadURL(DEV_URL);
     mainWindow.webContents.openDevTools({ mode: "detach" });
   }
 
-  // ✅ Auto Update – רק בגרסה ארוזה
   if (app.isPackaged) {
     setupAutoUpdates();
-
-    // בדיקה ראשונית
     autoUpdater.checkForUpdates();
-
-    // בדיקה כל 6 שעות
     setInterval(() => autoUpdater.checkForUpdates(), 6 * 60 * 60 * 1000);
   }
 }
 
 /* ======================================================
-   Lifecycle
+   Lifecycle (✅ בלי UnhandledPromiseRejection)
 ====================================================== */
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  createWindow().catch(async (err) => {
+    log.error("createWindow failed:", err);
+
+    try {
+      await dialog.showMessageBox({
+        type: "error",
+        title: "שגיאת הפעלה",
+        message: "האפליקציה לא הצליחה להפעיל את השרת הפנימי.",
+        detail: String(err?.message || err),
+      });
+    } catch {}
+
+    app.quit();
+  });
+});
 
 app.on("window-all-closed", () => {
   if (serverProcess) {
@@ -266,4 +257,3 @@ app.on("before-quit", () => {
     } catch {}
   }
 });
-
