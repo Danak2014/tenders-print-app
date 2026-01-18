@@ -28,6 +28,21 @@ ipcMain.handle("open-external", async (_event, url) => {
 });
 
 /* ======================================================
+   IPC – בדיקת עדכונים ידנית (UI → main)
+   (יעבוד רק בגרסה ארוזה)
+====================================================== */
+ipcMain.handle("check-updates", async () => {
+  try {
+    if (!app.isPackaged) return { ok: false, reason: "not_packaged" };
+    autoUpdater.checkForUpdates(); // לא צריך await
+    return { ok: true };
+  } catch (e) {
+    log.error("check-updates failed:", e);
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
+
+/* ======================================================
    עזר: בדיקת זמינות שרת
 ====================================================== */
 function pingServer(url) {
@@ -99,9 +114,7 @@ function installExternalLinkHandlers(win) {
   win.webContents.on("will-navigate", (event, url) => {
     const current = win.webContents.getURL();
     const isAppUrl =
-      url.startsWith(DEV_URL) ||
-      url.startsWith("file://") ||
-      url === current;
+      url.startsWith(DEV_URL) || url.startsWith("file://") || url === current;
 
     if (!isAppUrl) {
       event.preventDefault();
@@ -114,8 +127,11 @@ function installExternalLinkHandlers(win) {
    Auto Update (electron-updater)
 ====================================================== */
 function setupAutoUpdates() {
+  // לוגים
   log.transports.file.level = "info";
   autoUpdater.logger = log;
+
+  // לא מורידים אוטומטית בלי לשאול
   autoUpdater.autoDownload = false;
 
   autoUpdater.on("error", (err) => {
@@ -123,6 +139,11 @@ function setupAutoUpdates() {
   });
 
   autoUpdater.on("update-available", async () => {
+    // ✅ חיווי ל-UI (אם תרצי להציג Badge/Toast)
+    try {
+      mainWindow?.webContents?.send("update-available");
+    } catch {}
+
     const choice = await dialog.showMessageBox(mainWindow, {
       type: "info",
       buttons: ["להוריד עדכון", "לא עכשיו"],
@@ -139,13 +160,31 @@ function setupAutoUpdates() {
 
   autoUpdater.on("update-not-available", () => {
     log.info("No updates available");
+    // אופציונלי:
+    // try { mainWindow?.webContents?.send("update-not-available"); } catch {}
   });
 
   autoUpdater.on("download-progress", (p) => {
-    log.info(`Download ${p.percent.toFixed(1)}%`);
+    const percent = Number(p?.percent || 0);
+    log.info(`Download ${percent.toFixed(1)}%`);
+
+    // ✅ אופציונלי: חיווי התקדמות ל-UI
+    try {
+      mainWindow?.webContents?.send("update-download-progress", {
+        percent,
+        bytesPerSecond: p?.bytesPerSecond || 0,
+        transferred: p?.transferred || 0,
+        total: p?.total || 0,
+      });
+    } catch {}
   });
 
   autoUpdater.on("update-downloaded", async () => {
+    // ✅ חיווי ל-UI
+    try {
+      mainWindow?.webContents?.send("update-downloaded");
+    } catch {}
+
     const choice = await dialog.showMessageBox(mainWindow, {
       type: "question",
       buttons: ["להתקין עכשיו", "אחר כך"],
@@ -197,11 +236,12 @@ async function createWindow() {
   // ✅ Auto Update – רק בגרסה ארוזה
   if (app.isPackaged) {
     setupAutoUpdates();
+
+    // בדיקה ראשונית
     autoUpdater.checkForUpdates();
-    setInterval(
-      () => autoUpdater.checkForUpdates(),
-      6 * 60 * 60 * 1000
-    );
+
+    // בדיקה כל 6 שעות
+    setInterval(() => autoUpdater.checkForUpdates(), 6 * 60 * 60 * 1000);
   }
 }
 
@@ -226,3 +266,4 @@ app.on("before-quit", () => {
     } catch {}
   }
 });
+
