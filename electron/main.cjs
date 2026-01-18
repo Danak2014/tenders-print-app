@@ -15,15 +15,45 @@ const DEV_URL = "http://localhost:5173";
 
 /* ======================================================
    IPC – פתיחת קישור חיצוני (renderer → main)
+   ✅ כולל ולידציה כדי למנוע javascript:/file:/וכד'
 ====================================================== */
 ipcMain.handle("open-external", async (_event, url) => {
   try {
-    if (!url || typeof url !== "string") return false;
-    await shell.openExternal(url);
+    const raw = (url ?? "").toString().trim();
+    if (!raw) return false;
+
+    const allowedProtocols = new Set(["http:", "https:", "mailto:", "tel:"]);
+
+    let parsed;
+    try {
+      parsed = raw.includes("://") ? new URL(raw) : new URL(`https://${raw}`);
+    } catch {
+      try {
+        parsed = new URL(raw);
+      } catch {
+        return false;
+      }
+    }
+
+    if (!allowedProtocols.has(parsed.protocol)) return false;
+
+    await shell.openExternal(parsed.toString());
     return true;
   } catch (e) {
     log.error("open-external failed:", e);
     return false;
+  }
+});
+
+/* ======================================================
+   IPC – החזרת גרסת אפליקציה (renderer → main)
+====================================================== */
+ipcMain.handle("get-app-version", async () => {
+  try {
+    return app.getVersion();
+  } catch (e) {
+    log.error("get-app-version failed:", e);
+    return "";
   }
 });
 
@@ -43,11 +73,16 @@ function pingServer(url) {
   });
 }
 
-async function waitForServerReady(timeoutMs = 20000) {
+async function waitForServerReady(timeoutMs = 25000) {
   const start = Date.now();
   const url = `http://localhost:${SERVER_PORT}/api/tenders?q=test`;
 
   while (Date.now() - start < timeoutMs) {
+    // אם השרת כבר נפל – לא מחכים סתם עד timeout
+    if (serverProcess && serverProcess.exitCode != null) {
+      throw new Error(`Server exited early (code: ${serverProcess.exitCode})`);
+    }
+
     try {
       await pingServer(url);
       return;
@@ -61,17 +96,23 @@ async function waitForServerReady(timeoutMs = 20000) {
 
 /* ======================================================
    הפעלת server.cjs כתהליך Node פנימי
+   ✅ PROD: מריצים מתוך app.asar (app.getAppPath()) כדי שימצא node_modules
+   ✅ DEV : מריצים מתוך תיקיית הפרויקט
 ====================================================== */
+function resolveServerPath() {
+  // app.getAppPath() מצביע:
+  // DEV -> תיקיית הפרויקט
+  // PROD -> .../resources/app.asar
+  return path.join(app.getAppPath(), "server.cjs");
+}
+
 function startServer() {
-  // ✅ תיקון: ב-packaged server.cjs נמצא בתוך app.asar (app.getAppPath())
-  const serverPath = app.isPackaged
-    ? path.join(app.getAppPath(), "server.cjs")
-    : path.join(app.getAppPath(), "server.cjs"); // dev: app.getAppPath() מצביע לפרויקט
+  const serverPath = resolveServerPath();
 
   log.info("Starting server:", serverPath);
 
-  // ✅ חשוב: לא להתעלם מהפלט כדי שנראה למה השרת נופל
   serverProcess = spawn(process.execPath, [serverPath], {
+    cwd: app.getAppPath(), // ✅ חשוב במיוחד בפרוד
     env: {
       ...process.env,
       ELECTRON_RUN_AS_NODE: "1",
@@ -108,8 +149,7 @@ function installExternalLinkHandlers(win) {
 
   win.webContents.on("will-navigate", (event, url) => {
     const current = win.webContents.getURL();
-    const isAppUrl =
-      url.startsWith(DEV_URL) || url.startsWith("file://") || url === current;
+    const isAppUrl = url.startsWith(DEV_URL) || url.startsWith("file://") || url === current;
 
     if (!isAppUrl) {
       event.preventDefault();
@@ -124,6 +164,8 @@ function installExternalLinkHandlers(win) {
 function setupAutoUpdates() {
   log.transports.file.level = "info";
   autoUpdater.logger = log;
+
+  // לא מורידים אוטומטית בלי לשאול
   autoUpdater.autoDownload = false;
 
   autoUpdater.on("error", (err) => {
@@ -149,10 +191,13 @@ function setupAutoUpdates() {
 
   autoUpdater.on("update-not-available", () => {
     log.info("No updates available");
+    mainWindow?.webContents?.send("update-not-available");
   });
 
   autoUpdater.on("download-progress", (p) => {
-    log.info(`Download ${Number(p.percent || 0).toFixed(1)}%`);
+    const percent = Number(p?.percent || 0);
+    log.info(`Download ${percent.toFixed(1)}%`);
+    mainWindow?.webContents?.send("update-download-progress", { percent });
   });
 
   autoUpdater.on("update-downloaded", async () => {
@@ -207,7 +252,8 @@ async function createWindow() {
   installExternalLinkHandlers(mainWindow);
 
   if (app.isPackaged) {
-    const indexHtml = path.join(process.resourcesPath, "app.asar", "dist", "index.html");
+    // ✅ טוענים את ה-UI מתוך app.asar (בטוח ועקבי)
+    const indexHtml = path.join(app.getAppPath(), "dist", "index.html");
     await mainWindow.loadFile(indexHtml);
   } else {
     await mainWindow.loadURL(DEV_URL);
@@ -222,8 +268,16 @@ async function createWindow() {
 }
 
 /* ======================================================
-   Lifecycle (✅ בלי UnhandledPromiseRejection)
+   Lifecycle
 ====================================================== */
+function stopServer() {
+  if (!serverProcess) return;
+  try {
+    serverProcess.kill();
+  } catch {}
+  serverProcess = null;
+}
+
 app.whenReady().then(() => {
   createWindow().catch(async (err) => {
     log.error("createWindow failed:", err);
@@ -242,18 +296,10 @@ app.whenReady().then(() => {
 });
 
 app.on("window-all-closed", () => {
-  if (serverProcess) {
-    try {
-      serverProcess.kill();
-    } catch {}
-  }
+  stopServer();
   if (process.platform !== "darwin") app.quit();
 });
 
 app.on("before-quit", () => {
-  if (serverProcess) {
-    try {
-      serverProcess.kill();
-    } catch {}
-  }
+  stopServer();
 });
